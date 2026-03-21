@@ -1,0 +1,1759 @@
+# ============================================================
+# MULTIMEDALIS RADAR GESTURE RECOGNITION - might need debugging
+# ============================================================
+# Requirements: High VRAM GPU (20-30 GB recommended)
+# 
+# Pipeline:
+#   Phase 1: MAE Self-Supervised Pretraining
+#   Phase 2: Supervised Contrastive Learning (SupCon)
+#   Phase 3: Multi-Architecture Fine-Tuning
+#            - AST (Audio Spectrogram Transformer)
+#            - Multi-Stream Cross-Attention (3 antennas)
+#            - EfficientNet-B4
+#            - CRNN (CNN + BiGRU)
+#   Phase 4: Ensemble Teacher
+#   Phase 5: Knowledge Distillation → Fast Student
+#   Phase 6: Submission Generation
+#
+# Includes: Bayesian Optimization, Early Stopping, LR Scheduling
+# ============================================================
+
+import os
+import gc
+import json
+import copy
+import math
+import random
+import warnings
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+from functools import partial
+
+warnings.filterwarnings('ignore')
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, OneCycleLR
+from torch.cuda.amp import autocast, GradScaler
+
+import timm
+from tqdm.auto import tqdm
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import accuracy_score, balanced_accuracy_score
+
+import optuna
+from optuna.samplers import TPESampler
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+ROOT = Path("/home/rsnfh/Downloads/CVPR MSLR 2026 Track 2")
+OUTPUT_DIR = Path("/home/rsnfh/Downloads/CVPR MSLR 2026 Track 2/DreamGPU_Results")
+OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True  # Enable for speed on dream GPU
+
+set_seed(42)
+
+def clear_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+if torch.cuda.is_available():
+    gpu_name = torch.cuda.get_device_name()
+    gpu_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    print(f"GPU: {gpu_name}")
+    print(f"VRAM: {gpu_vram:.1f} GB")
+
+# Dream GPU configuration — large batches, high resolution, heavy models
+CONFIG = {
+    # Data
+    "num_classes": 126,
+    "target_frames": 128,        # Higher resolution (was 64)
+    "range_bins": 256,
+    
+    # Training
+    "batch_size": 64,             # Large batch for SupCon (was 16)
+    "num_workers": 8,
+    "use_amp": True,
+    "gradient_clip": 1.0,
+    
+    # Cross-validation
+    "n_folds": 5,                 # Full 5-fold (was 3)
+    
+    # MAE Pretraining
+    "mae_epochs": 100,
+    "mae_batch_size": 128,
+    "mae_lr": 1.5e-4,
+    "mae_mask_ratio": 0.75,
+    "mae_warmup_epochs": 10,
+    
+    # SupCon
+    "supcon_epochs": 50,
+    "supcon_lr": 5e-4,
+    "supcon_temperature": 0.07,
+    "supcon_batch_size": 256,     # Large batch critical for contrastive
+    
+    # Fine-tuning
+    "finetune_epochs": 80,
+    "finetune_lr": 1e-3,
+    "early_stopping_patience": 15,
+    "label_smoothing": 0.1,
+    "mixup_alpha": 0.3,
+    "cutmix_alpha": 1.0,
+    "cutmix_prob": 0.3,
+    
+    # Bayesian optimization
+    "n_optuna_trials": 30,
+    "optuna_epochs": 12,
+    
+    # Distillation
+    "distill_epochs": 60,
+    "distill_temperature": 4.0,
+    "distill_alpha": 0.7,
+}
+
+print(f"\nDream GPU Configuration:")
+for k, v in CONFIG.items():
+    print(f"  {k}: {v}")
+
+# ============================================================
+# RADAR-SPECIFIC AUGMENTATIONS
+# ============================================================
+class RadarSpecAugment:
+    """Enhanced radar-specific augmentations for high-resolution RTMs."""
+    
+    def __init__(self, p=0.5, strong=False):
+        self.p = p
+        self.strong = strong
+        
+        # Parameters scale with resolution
+        self.time_mask_param = 16 if strong else 10
+        self.range_mask_param = 30 if strong else 20
+        self.n_time_masks = 3 if strong else 2
+        self.n_range_masks = 3 if strong else 2
+        self.time_shift_max = 12 if strong else 8
+        self.range_shift_max = 6 if strong else 4
+        self.noise_std = 0.12 if strong else 0.08
+    
+    def time_mask(self, rtm):
+        if random.random() > self.p: return rtm
+        rtm = rtm.copy()
+        T, R = rtm.shape
+        for _ in range(self.n_time_masks):
+            t = random.randint(1, min(self.time_mask_param, T - 1))
+            t0 = random.randint(0, T - t)
+            rtm[t0:t0+t, :] = 0
+        return rtm
+    
+    def range_mask(self, rtm):
+        if random.random() > self.p: return rtm
+        rtm = rtm.copy()
+        T, R = rtm.shape
+        for _ in range(self.n_range_masks):
+            r = random.randint(1, min(self.range_mask_param, R - 1))
+            r0 = random.randint(0, R - r)
+            rtm[:, r0:r0+r] = 0
+        return rtm
+    
+    def time_shift(self, rtm):
+        if random.random() > self.p: return rtm
+        return np.roll(rtm, random.randint(-self.time_shift_max, self.time_shift_max), axis=0)
+    
+    def range_shift(self, rtm):
+        if random.random() > self.p: return rtm
+        return np.roll(rtm, random.randint(-self.range_shift_max, self.range_shift_max), axis=1)
+    
+    def add_noise(self, rtm):
+        if random.random() > self.p: return rtm
+        return rtm + np.random.randn(*rtm.shape).astype(np.float32) * self.noise_std
+    
+    def scale(self, rtm):
+        if random.random() > self.p: return rtm
+        return rtm * random.uniform(0.85, 1.15)
+    
+    def time_warp(self, rtm):
+        if random.random() > 0.3: return rtm
+        T, R = rtm.shape
+        warp = random.uniform(0.85, 1.15)
+        new_T = int(T * warp)
+        t = torch.tensor(rtm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        t = F.interpolate(t, size=(new_T, R), mode='bilinear', align_corners=False)
+        t = F.interpolate(t, size=(T, R), mode='bilinear', align_corners=False)
+        return t.squeeze().numpy()
+    
+    def __call__(self, rtm):
+        rtm = self.time_shift(rtm)
+        rtm = self.range_shift(rtm)
+        rtm = self.time_warp(rtm)
+        rtm = self.time_mask(rtm)
+        rtm = self.range_mask(rtm)
+        rtm = self.add_noise(rtm)
+        rtm = self.scale(rtm)
+        return rtm
+
+
+# ============================================================
+# DATASET
+# ============================================================
+class RadarGestureDataset(Dataset):
+    """Dataset supporting all training modes: MAE, SupCon, Classification, Distillation."""
+    
+    def __init__(self, samples, target_frames=128, augment=False,
+                 augmenter=None, is_test=False, soft_labels=None,
+                 mode='classification', return_separate_antennas=False):
+        """
+        mode: 'classification' | 'mae' | 'supcon' | 'distillation'
+        return_separate_antennas: If True, return (rtm1, rtm2, rtm3) separately
+        """
+        self.samples = samples
+        self.target_frames = target_frames
+        self.augment = augment
+        self.augmenter = augmenter if augmenter else RadarSpecAugment()
+        self.strong_augmenter = RadarSpecAugment(strong=True)
+        self.is_test = is_test
+        self.soft_labels = soft_labels
+        self.mode = mode
+        self.return_separate_antennas = return_separate_antennas
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def _load_rtm(self, npy_path):
+        return np.load(npy_path).astype(np.float32)
+    
+    def _resize_temporal(self, rtm):
+        T, R = rtm.shape
+        if T == self.target_frames:
+            return rtm
+        t = torch.tensor(rtm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        t = F.interpolate(t, size=(self.target_frames, R), mode='bilinear', align_corners=False)
+        return t.squeeze().numpy()
+    
+    def _normalize(self, rtm):
+        return (rtm - rtm.mean()) / (rtm.std() + 1e-8)
+    
+    def _load_single_rtm(self, sample_dir, rtm_name, apply_aug=True):
+        """Load, resize, normalize, and optionally augment a single RTM."""
+        npy_files = list(sample_dir.glob(f"*_{rtm_name}.npy"))
+        if npy_files:
+            rtm = self._load_rtm(npy_files[0])
+            rtm = self._resize_temporal(rtm)
+            rtm = self._normalize(rtm)
+            if apply_aug and self.augment:
+                rtm = self.augmenter(rtm)
+            return rtm
+        return np.zeros((self.target_frames, 256), dtype=np.float32)
+    
+    def __getitem__(self, idx):
+        sample_dir, label, sample_id, session_id = self.samples[idx]
+        
+        if self.mode == 'supcon':
+            # SupCon: Return two augmented views of the same sample
+            rtms_view1 = []
+            rtms_view2 = []
+            for name in ["RTM1", "RTM2", "RTM3"]:
+                npy_files = list(sample_dir.glob(f"*_{name}.npy"))
+                if npy_files:
+                    rtm = self._load_rtm(npy_files[0])
+                    rtm = self._resize_temporal(rtm)
+                    rtm = self._normalize(rtm)
+                    
+                    view1 = self.augmenter(rtm.copy())
+                    view2 = self.strong_augmenter(rtm.copy())
+                    
+                    rtms_view1.append(view1)
+                    rtms_view2.append(view2)
+                else:
+                    z = np.zeros((self.target_frames, 256), dtype=np.float32)
+                    rtms_view1.append(z)
+                    rtms_view2.append(z)
+            
+            x1 = torch.tensor(np.stack(rtms_view1, axis=0), dtype=torch.float32)
+            x2 = torch.tensor(np.stack(rtms_view2, axis=0), dtype=torch.float32)
+            y = torch.tensor(label, dtype=torch.long)
+            
+            return x1, x2, y, sample_id
+        
+        elif self.mode == 'mae':
+            # MAE: Return unaugmented sample for reconstruction
+            rtms = []
+            for name in ["RTM1", "RTM2", "RTM3"]:
+                rtms.append(self._load_single_rtm(sample_dir, name, apply_aug=False))
+            
+            x = torch.tensor(np.stack(rtms, axis=0), dtype=torch.float32)
+            return x, sample_id
+        
+        else:
+            # Classification or Distillation
+            if self.return_separate_antennas:
+                # For Multi-Stream Cross-Attention model
+                rtm1 = self._load_single_rtm(sample_dir, "RTM1")
+                rtm2 = self._load_single_rtm(sample_dir, "RTM2")
+                rtm3 = self._load_single_rtm(sample_dir, "RTM3")
+                
+                x1 = torch.tensor(rtm1, dtype=torch.float32).unsqueeze(0)  # (1, T, R)
+                x2 = torch.tensor(rtm2, dtype=torch.float32).unsqueeze(0)
+                x3 = torch.tensor(rtm3, dtype=torch.float32).unsqueeze(0)
+                
+                y = torch.tensor(label if not self.is_test else -1, dtype=torch.long)
+                
+                if self.soft_labels is not None:
+                    soft_y = torch.tensor(self.soft_labels[idx], dtype=torch.float32)
+                    return (x1, x2, x3), y, soft_y, sample_id
+                
+                return (x1, x2, x3), y, sample_id
+            else:
+                # Standard stacked input
+                rtms = []
+                for name in ["RTM1", "RTM2", "RTM3"]:
+                    rtms.append(self._load_single_rtm(sample_dir, name))
+                
+                x = torch.tensor(np.stack(rtms, axis=0), dtype=torch.float32)
+                y = torch.tensor(label if not self.is_test else -1, dtype=torch.long)
+                
+                if self.soft_labels is not None:
+                    soft_y = torch.tensor(self.soft_labels[idx], dtype=torch.float32)
+                    return x, y, soft_y, sample_id
+                
+                return x, y, sample_id
+
+
+def load_all_samples(root):
+    """Load all dataset samples with session information."""
+    train_path = root / "train"
+    val_path = root / "val"
+    test_path = root / "test"
+    
+    train_samples = []
+    class_to_idx = {}
+    class_samples = defaultdict(list)
+    
+    for cls_dir in sorted(train_path.iterdir()):
+        if not cls_dir.is_dir(): continue
+        cls_name = cls_dir.name
+        cls_id = int(cls_name.split("_")[0])
+        class_to_idx[cls_name] = cls_id
+        
+        for sample_dir in sorted(cls_dir.iterdir()):
+            if sample_dir.is_dir():
+                sample_id = int(sample_dir.name.replace("SAMPLE_", ""))
+                class_samples[cls_id].append((sample_dir, cls_id, sample_id))
+    
+    for cls_id, samples in class_samples.items():
+        for session_idx, (sample_dir, label, sample_id) in enumerate(samples):
+            train_samples.append((sample_dir, label, sample_id, session_idx))
+    
+    val_samples = []
+    for sample_dir in sorted(val_path.iterdir()):
+        if sample_dir.is_dir():
+            sample_id = int(sample_dir.name.replace("SAMPLE_", ""))
+            val_samples.append((sample_dir, -1, sample_id, -1))
+    
+    test_samples = []
+    for sample_dir in sorted(test_path.iterdir()):
+        if sample_dir.is_dir():
+            sample_id = int(sample_dir.name.replace("SAMPLE_", ""))
+            test_samples.append((sample_dir, -1, sample_id, -1))
+    
+    print(f"Training: {len(train_samples)}, Val: {len(val_samples)}, Test: {len(test_samples)}")
+    print(f"Classes: {len(class_to_idx)}")
+    
+    return train_samples, val_samples, test_samples, class_to_idx
+
+
+train_samples, val_samples, test_samples, class_to_idx = load_all_samples(ROOT)
+
+
+# ============================================================
+# PHASE 1: MASKED AUTOENCODER (MAE) PRETRAINING
+# ============================================================
+class PatchEmbed(nn.Module):
+    """Convert RTM to patch embeddings."""
+    
+    def __init__(self, img_size=(128, 256), patch_size=(8, 16), in_chans=3, embed_dim=768):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size[0] // patch_size[0]) * (img_size[1] // patch_size[1])
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+    
+    def forward(self, x):
+        # x: (B, C, H, W) -> (B, num_patches, embed_dim)
+        x = self.proj(x)
+        x = x.flatten(2).transpose(1, 2)
+        return x
+
+
+class MAEEncoder(nn.Module):
+    """MAE Encoder - processes only visible (unmasked) patches."""
+    
+    def __init__(self, img_size=(128, 256), patch_size=(8, 16), in_chans=3,
+                 embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.0):
+        super().__init__()
+        
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        self.num_patches = self.patch_embed.num_patches
+        
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
+        
+        self.blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim, nhead=num_heads,
+                dim_feedforward=int(embed_dim * mlp_ratio),
+                dropout=0.0, activation='gelu', batch_first=True,
+                norm_first=True
+            )
+            for _ in range(depth)
+        ])
+        
+        self.norm = nn.LayerNorm(embed_dim)
+        self.embed_dim = embed_dim
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+    
+    def forward(self, x, mask_ratio=0.75):
+        """
+        x: (B, C, H, W)
+        Returns: encoded visible patches, mask, ids_restore
+        """
+        B = x.shape[0]
+        
+        # Patch embedding
+        x = self.patch_embed(x)  # (B, N, D)
+        N = x.shape[1]
+        
+        # Add positional embedding (without cls token)
+        x = x + self.pos_embed[:, 1:, :]
+        
+        # Random masking
+        len_keep = int(N * (1 - mask_ratio))
+        noise = torch.rand(B, N, device=x.device)
+        
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        
+        # Keep only visible patches
+        ids_keep = ids_shuffle[:, :len_keep]
+        x = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+        
+        # Create mask: 0 = keep, 1 = masked
+        mask = torch.ones(B, N, device=x.device)
+        mask[:, :len_keep] = 0
+        mask = torch.gather(mask, dim=1, index=ids_restore)
+        
+        # Prepend cls token
+        cls_tokens = self.cls_token.expand(B, -1, -1) + self.pos_embed[:, :1, :]
+        x = torch.cat([cls_tokens, x], dim=1)
+        
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+        
+        x = self.norm(x)
+        
+        return x, mask, ids_restore
+
+
+class MAEDecoder(nn.Module):
+    """MAE Decoder - reconstructs masked patches."""
+    
+    def __init__(self, num_patches, patch_size=(8, 16), in_chans=3,
+                 encoder_dim=768, decoder_dim=512, depth=4, num_heads=8):
+        super().__init__()
+        
+        self.decoder_embed = nn.Linear(encoder_dim, decoder_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_dim))
+        
+        self.blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=decoder_dim, nhead=num_heads,
+                dim_feedforward=decoder_dim * 4,
+                dropout=0.0, activation='gelu', batch_first=True,
+                norm_first=True
+            )
+            for _ in range(depth)
+        ])
+        
+        self.norm = nn.LayerNorm(decoder_dim)
+        self.pred = nn.Linear(decoder_dim, patch_size[0] * patch_size[1] * in_chans)
+        
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+        nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
+    
+    def forward(self, x, ids_restore):
+        """
+        x: encoder output (B, len_keep+1, encoder_dim)
+        ids_restore: (B, N)
+        """
+        B, _, _ = x.shape
+        N = ids_restore.shape[1]
+        
+        # Embed tokens
+        x = self.decoder_embed(x)  # (B, len_keep+1, decoder_dim)
+        
+        # Append mask tokens
+        mask_tokens = self.mask_token.repeat(B, N + 1 - x.shape[1], 1)
+        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # No cls token
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).expand(-1, -1, x_.shape[-1]))
+        x = torch.cat([x[:, :1, :], x_], dim=1)  # Add cls token back
+        
+        # Add positional embedding
+        x = x + self.decoder_pos_embed
+        
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+        
+        x = self.norm(x)
+        x = self.pred(x)  # (B, N+1, patch_h * patch_w * C)
+        
+        # Remove cls token
+        x = x[:, 1:, :]
+        
+        return x
+
+
+class MAE(nn.Module):
+    """Complete Masked Autoencoder for RTM pretraining."""
+    
+    def __init__(self, img_size=(128, 256), patch_size=(8, 16), in_chans=3,
+                 embed_dim=768, encoder_depth=12, encoder_heads=12,
+                 decoder_dim=512, decoder_depth=4, decoder_heads=8):
+        super().__init__()
+        
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        
+        self.encoder = MAEEncoder(
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans,
+            embed_dim=embed_dim, depth=encoder_depth, num_heads=encoder_heads
+        )
+        
+        self.decoder = MAEDecoder(
+            num_patches=self.encoder.num_patches,
+            patch_size=patch_size, in_chans=in_chans,
+            encoder_dim=embed_dim, decoder_dim=decoder_dim,
+            depth=decoder_depth, num_heads=decoder_heads
+        )
+    
+    def patchify(self, imgs):
+        """Convert images to patches."""
+        B, C, H, W = imgs.shape
+        pH, pW = self.patch_size
+        nH, nW = H // pH, W // pW
+        
+        x = imgs.reshape(B, C, nH, pH, nW, pW)
+        x = x.permute(0, 2, 4, 3, 5, 1).reshape(B, nH * nW, pH * pW * C)
+        return x
+    
+    def forward(self, x, mask_ratio=0.75):
+        """
+        x: (B, C, H, W) - RTM input
+        Returns: loss, reconstructed patches, mask
+        """
+        # Encode visible patches
+        latent, mask, ids_restore = self.encoder(x, mask_ratio)
+        
+        # Decode (reconstruct all patches)
+        pred = self.decoder(latent, ids_restore)
+        
+        # Target: original patches
+        target = self.patchify(x)
+        
+        # MSE loss on masked patches only
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)  # Per-patch loss
+        loss = (loss * mask).sum() / mask.sum()  # Only masked patches
+        
+        return loss, pred, mask
+    
+    def get_encoder(self):
+        """Extract encoder for downstream tasks."""
+        return self.encoder
+
+
+def train_mae(train_samples, config, device):
+    """Phase 1: MAE Self-Supervised Pretraining."""
+    print("\n" + "="*80)
+    print("PHASE 1: MASKED AUTOENCODER PRETRAINING")
+    print("="*80)
+    
+    # Dataset (no labels needed, no augmentation)
+    dataset = RadarGestureDataset(
+        train_samples, target_frames=config['target_frames'],
+        augment=False, mode='mae'
+    )
+    loader = DataLoader(
+        dataset, batch_size=config['mae_batch_size'],
+        shuffle=True, num_workers=config['num_workers'],
+        pin_memory=True, drop_last=True
+    )
+    
+    # Create MAE
+    mae = MAE(
+        img_size=(config['target_frames'], config['range_bins']),
+        patch_size=(8, 16), in_chans=3,
+        embed_dim=768, encoder_depth=12, encoder_heads=12,
+        decoder_dim=512, decoder_depth=4, decoder_heads=8
+    ).to(device)
+    
+    n_params = sum(p.numel() for p in mae.parameters())
+    print(f"MAE parameters: {n_params:,}")
+    
+    optimizer = AdamW(mae.parameters(), lr=config['mae_lr'],
+                      weight_decay=0.05, betas=(0.9, 0.95))
+    
+    # Cosine schedule with warmup
+    warmup_steps = config['mae_warmup_epochs'] * len(loader)
+    total_steps = config['mae_epochs'] * len(loader)
+    
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / (total_steps - warmup_steps)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scaler = GradScaler(enabled=config['use_amp'])
+    
+    # Training loop
+    mae_losses = []
+    
+    for epoch in range(config['mae_epochs']):
+        mae.train()
+        epoch_loss = 0
+        
+        pbar = tqdm(loader, desc=f"MAE Epoch {epoch+1}/{config['mae_epochs']}")
+        for x, _ in pbar:
+            x = x.to(device)
+            
+            with autocast(enabled=config['use_amp']):
+                loss, _, _ = mae(x, mask_ratio=config['mae_mask_ratio'])
+            
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(mae.parameters(), config['gradient_clip'])
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            
+            epoch_loss += loss.item()
+            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'})
+        
+        avg_loss = epoch_loss / len(loader)
+        mae_losses.append(avg_loss)
+        print(f"  MAE Epoch {epoch+1}: Loss = {avg_loss:.4f}")
+    
+    # Save MAE encoder weights
+    torch.save({
+        'encoder_state_dict': mae.encoder.state_dict(),
+        'config': config
+    }, OUTPUT_DIR / "mae_encoder.pth")
+    
+    # Plot MAE loss
+    plt.figure(figsize=(10, 4))
+    plt.plot(mae_losses, linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('MAE Reconstruction Loss')
+    plt.title('MAE Pretraining Loss')
+    plt.grid(alpha=0.3)
+    plt.savefig(OUTPUT_DIR / "mae_loss.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"✓ MAE pretraining complete. Encoder saved.")
+    
+    return mae.encoder
+
+
+# ============================================================
+# PHASE 2: SUPERVISED CONTRASTIVE LEARNING
+# ============================================================
+class ProjectionHead(nn.Module):
+    """MLP projection head for SupCon."""
+    def __init__(self, in_dim, hidden_dim=2048, out_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim)
+        )
+    
+    def forward(self, x):
+        return F.normalize(self.net(x), dim=1)
+
+
+class SupConLoss(nn.Module):
+    """Supervised Contrastive Loss."""
+    
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+    
+    def forward(self, features, labels):
+        """
+        features: (2*B, dim) - concatenated features from two views
+        labels: (2*B,) - concatenated labels
+        """
+        B = features.shape[0]
+        
+        # Compute similarity matrix
+        sim_matrix = torch.matmul(features, features.T) / self.temperature
+        
+        # Mask self-similarity
+        mask_self = torch.eye(B, device=features.device).bool()
+        sim_matrix = sim_matrix.masked_fill(mask_self, -1e9)
+        
+        # Positive mask: same label, different sample
+        labels = labels.unsqueeze(1)
+        mask_pos = (labels == labels.T).float()
+        mask_pos = mask_pos.masked_fill(mask_self, 0)
+        
+        # Compute log-softmax
+        log_softmax = sim_matrix - torch.logsumexp(sim_matrix, dim=1, keepdim=True)
+        
+        # Average over positive pairs
+        num_pos = mask_pos.sum(dim=1).clamp(min=1)
+        loss = -(mask_pos * log_softmax).sum(dim=1) / num_pos
+        
+        return loss.mean()
+
+
+class SupConModel(nn.Module):
+    """Backbone + Projection Head for SupCon training."""
+    
+    def __init__(self, backbone, feature_dim, proj_dim=256):
+        super().__init__()
+        self.backbone = backbone
+        self.projector = ProjectionHead(feature_dim, hidden_dim=2048, out_dim=proj_dim)
+    
+    def forward(self, x):
+        features = self.backbone(x)
+        projections = self.projector(features)
+        return features, projections
+
+
+def train_supcon(train_samples, config, device, pretrained_encoder=None):
+    """Phase 2: Supervised Contrastive Learning."""
+    print("\n" + "="*80)
+    print("PHASE 2: SUPERVISED CONTRASTIVE LEARNING")
+    print("="*80)
+    
+    # Dataset with two augmented views
+    dataset = RadarGestureDataset(
+        train_samples, target_frames=config['target_frames'],
+        augment=True, mode='supcon'
+    )
+    loader = DataLoader(
+        dataset, batch_size=config['supcon_batch_size'],
+        shuffle=True, num_workers=config['num_workers'],
+        pin_memory=True, drop_last=True
+    )
+    
+    # Backbone
+    backbone = timm.create_model('efficientnet_b4', pretrained=True, num_classes=0, in_chans=3)
+    feature_dim = backbone.num_features
+    
+    supcon_model = SupConModel(backbone, feature_dim, proj_dim=256).to(device)
+    
+    criterion = SupConLoss(temperature=config['supcon_temperature'])
+    optimizer = AdamW(supcon_model.parameters(), lr=config['supcon_lr'], weight_decay=1e-4)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-7)
+    scaler = GradScaler(enabled=config['use_amp'])
+    
+    n_params = sum(p.numel() for p in supcon_model.parameters())
+    print(f"SupCon model parameters: {n_params:,}")
+    
+    supcon_losses = []
+    
+    for epoch in range(config['supcon_epochs']):
+        supcon_model.train()
+        epoch_loss = 0
+        
+        pbar = tqdm(loader, desc=f"SupCon Epoch {epoch+1}/{config['supcon_epochs']}")
+        for x1, x2, y, _ in pbar:
+            x1, x2, y = x1.to(device), x2.to(device), y.to(device)
+            
+            with autocast(enabled=config['use_amp']):
+                # Forward both views
+                _, proj1 = supcon_model(x1)
+                _, proj2 = supcon_model(x2)
+                
+                # Concatenate
+                projections = torch.cat([proj1, proj2], dim=0)
+                labels = torch.cat([y, y], dim=0)
+                
+                loss = criterion(projections, labels)
+            
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(supcon_model.parameters(), config['gradient_clip'])
+            scaler.step(optimizer)
+            scaler.update()
+            
+            epoch_loss += loss.item()
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        
+        scheduler.step()
+        avg_loss = epoch_loss / len(loader)
+        supcon_losses.append(avg_loss)
+        print(f"  SupCon Epoch {epoch+1}: Loss = {avg_loss:.4f}")
+    
+    # Save backbone weights
+    torch.save({
+        'backbone_state_dict': supcon_model.backbone.state_dict(),
+        'feature_dim': feature_dim
+    }, OUTPUT_DIR / "supcon_backbone.pth")
+    
+    plt.figure(figsize=(10, 4))
+    plt.plot(supcon_losses, linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('SupCon Loss')
+    plt.title('Supervised Contrastive Learning Loss')
+    plt.grid(alpha=0.3)
+    plt.savefig(OUTPUT_DIR / "supcon_loss.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"✓ SupCon pretraining complete. Backbone saved.")
+    
+    return supcon_model.backbone
+
+
+# ============================================================
+# PHASE 3: MODEL ARCHITECTURES
+# ============================================================
+
+# --- 3A: Audio Spectrogram Transformer (AST) ---
+class ASTModel(nn.Module):
+    """Audio Spectrogram Transformer adapted for Radar RTMs."""
+    
+    def __init__(self, num_classes=126, dropout=0.3, img_size=(128, 256),
+                 patch_size=(16, 16), embed_dim=768, depth=12, num_heads=12):
+        super().__init__()
+        
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans=3, embed_dim=embed_dim)
+        num_patches = self.patch_embed.num_patches
+        
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 2, embed_dim))
+        
+        self.blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim, nhead=num_heads,
+                dim_feedforward=embed_dim * 4,
+                dropout=0.1, activation='gelu', batch_first=True,
+                norm_first=True
+            )
+            for _ in range(depth)
+        ])
+        
+        self.norm = nn.LayerNorm(embed_dim)
+        
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(embed_dim * 2),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, 512),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(512, num_classes)
+        )
+        
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.dist_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+    
+    def forward(self, x):
+        B = x.shape[0]
+        
+        x = self.patch_embed(x)
+        
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        dist_tokens = self.dist_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, dist_tokens, x], dim=1)
+        
+        x = x + self.pos_embed
+        
+        for block in self.blocks:
+            x = block(x)
+        
+        x = self.norm(x)
+        
+        cls_out = x[:, 0]
+        dist_out = x[:, 1]
+        combined = torch.cat([cls_out, dist_out], dim=1)
+        
+        return self.classifier(combined)
+
+
+# --- 3B: Multi-Stream Cross-Attention ---
+class AntennaEncoder(nn.Module):
+    """Single antenna stream encoder."""
+    def __init__(self, embed_dim=256, pretrained=True):
+        super().__init__()
+        self.backbone = timm.create_model(
+            'efficientnet_b2', pretrained=pretrained,
+            num_classes=0, in_chans=1
+        )
+        self.feature_dim = self.backbone.num_features
+        self.proj = nn.Linear(self.feature_dim, embed_dim)
+    
+    def forward(self, x):
+        # x: (B, 1, T, R) single antenna
+        features = self.backbone(x)  # (B, feature_dim)
+        return self.proj(features)   # (B, embed_dim)
+
+
+class CrossAttentionFusion(nn.Module):
+    """Cross-attention between antenna streams."""
+    
+    def __init__(self, embed_dim=256, num_heads=8, num_layers=2):
+        super().__init__()
+        
+        self.cross_attn_layers = nn.ModuleList([
+            nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+            for _ in range(num_layers)
+        ])
+        
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(embed_dim) for _ in range(num_layers)
+        ])
+        
+        self.ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 4),
+                nn.GELU(),
+                nn.Linear(embed_dim * 4, embed_dim)
+            )
+            for _ in range(num_layers)
+        ])
+        
+        self.ffn_norms = nn.ModuleList([
+            nn.LayerNorm(embed_dim) for _ in range(num_layers)
+        ])
+    
+    def forward(self, x):
+        """
+        x: (B, 3, embed_dim) - 3 antenna features stacked
+        """
+        for attn, norm, ffn, ffn_norm in zip(
+            self.cross_attn_layers, self.norms, self.ffns, self.ffn_norms
+        ):
+            # Self-attention across antennas
+            attn_out, _ = attn(x, x, x)
+            x = norm(x + attn_out)
+            
+            ffn_out = ffn(x)
+            x = ffn_norm(x + ffn_out)
+        
+        return x
+
+
+class MultiStreamCrossAttentionModel(nn.Module):
+    """Process each antenna separately, fuse with cross-attention."""
+    
+    def __init__(self, num_classes=126, embed_dim=256, dropout=0.3):
+        super().__init__()
+        
+        # Separate encoders for each antenna
+        self.encoder1 = AntennaEncoder(embed_dim)
+        self.encoder2 = AntennaEncoder(embed_dim)
+        self.encoder3 = AntennaEncoder(embed_dim)
+        
+        # Cross-attention fusion
+        self.fusion = CrossAttentionFusion(embed_dim, num_heads=8, num_layers=2)
+        
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(embed_dim * 3),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 3, 512),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(512, num_classes)
+        )
+    
+    def forward(self, inputs):
+        """
+        inputs: tuple of (x1, x2, x3), each (B, 1, T, R)
+        """
+        if isinstance(inputs, (list, tuple)):
+            x1, x2, x3 = inputs
+        else:
+            # If stacked input (B, 3, T, R), split
+            x1 = inputs[:, 0:1, :, :]
+            x2 = inputs[:, 1:2, :, :]
+            x3 = inputs[:, 2:3, :, :]
+        
+        # Encode each antenna
+        f1 = self.encoder1(x1)  # (B, embed_dim)
+        f2 = self.encoder2(x2)
+        f3 = self.encoder3(x3)
+        
+        # Stack for cross-attention
+        fused = torch.stack([f1, f2, f3], dim=1)  # (B, 3, embed_dim)
+        fused = self.fusion(fused)  # (B, 3, embed_dim)
+        
+        # Flatten and classify
+        fused = fused.reshape(fused.shape[0], -1)  # (B, 3*embed_dim)
+        return self.classifier(fused)
+
+
+# --- 3C: EfficientNet-B4 with SupCon pretrained backbone ---
+class EfficientNetB4Model(nn.Module):
+    """EfficientNet-B4 (larger than B0, feasible on dream GPU)."""
+    
+    def __init__(self, num_classes=126, dropout=0.3, pretrained=True):
+        super().__init__()
+        self.backbone = timm.create_model(
+            'efficientnet_b4', pretrained=pretrained,
+            num_classes=0, in_chans=3
+        )
+        self.feature_dim = self.backbone.num_features
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(self.feature_dim, 512),
+            nn.SiLU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(512, num_classes)
+        )
+    
+    def forward(self, x):
+        return self.classifier(self.backbone(x))
+    
+    def load_supcon_backbone(self, state_dict):
+        """Load SupCon-pretrained backbone weights."""
+        self.backbone.load_state_dict(state_dict, strict=False)
+        print("  Loaded SupCon pretrained backbone")
+
+
+# --- 3D: CRNN (CNN + BiGRU) ---
+class CRNNModel(nn.Module):
+    """CNN + BiGRU with attention pooling."""
+    
+    def __init__(self, num_classes=126, dropout=0.3, in_channels=3,
+                 cnn_channels=[64, 128, 256], gru_hidden=256, gru_layers=2):
+        super().__init__()
+        
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_channels, cnn_channels[0], 7, stride=2, padding=3),
+            nn.BatchNorm1d(cnn_channels[0]), nn.ReLU(True), nn.MaxPool1d(2),
+            nn.Conv1d(cnn_channels[0], cnn_channels[1], 5, stride=2, padding=2),
+            nn.BatchNorm1d(cnn_channels[1]), nn.ReLU(True), nn.MaxPool1d(2),
+            nn.Conv1d(cnn_channels[1], cnn_channels[2], 3, stride=1, padding=1),
+            nn.BatchNorm1d(cnn_channels[2]), nn.ReLU(True),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        
+        self.gru = nn.GRU(cnn_channels[2], gru_hidden, gru_layers,
+                          batch_first=True, bidirectional=True,
+                          dropout=dropout if gru_layers > 1 else 0)
+        
+        self.attention = nn.Sequential(
+            nn.Linear(gru_hidden * 2, 128), nn.Tanh(), nn.Linear(128, 1))
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(gru_hidden * 2, 256), nn.ReLU(True),
+            nn.Dropout(dropout / 2),
+            nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, x):
+        B, C, T, R = x.shape
+        x = x.permute(0, 2, 1, 3).reshape(B * T, C, R)
+        x = self.cnn(x).squeeze(-1).reshape(B, T, -1)
+        x, _ = self.gru(x)
+        attn = F.softmax(self.attention(x), dim=1)
+        x = (attn * x).sum(dim=1)
+        return self.classifier(x)
+
+
+# --- 3E: Student Model ---
+class StudentModel(nn.Module):
+    """Fast student model for distillation."""
+    def __init__(self, num_classes=126, dropout=0.2):
+        super().__init__()
+        self.backbone = timm.create_model(
+            'efficientnet_b0', pretrained=True, num_classes=0, in_chans=3)
+        self.feature_dim = self.backbone.num_features
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(self.feature_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, x):
+        return self.classifier(self.backbone(x))
+
+
+def get_model(model_type, config, supcon_backbone=None):
+    """Model factory."""
+    if model_type == 'ast':
+        return ASTModel(config['num_classes'], config.get('dropout', 0.3),
+                        img_size=(config['target_frames'], config['range_bins']))
+    elif model_type == 'multistream':
+        return MultiStreamCrossAttentionModel(config['num_classes'], dropout=config.get('dropout', 0.3))
+    elif model_type == 'efficientnet':
+        model = EfficientNetB4Model(config['num_classes'], config.get('dropout', 0.3))
+        if supcon_backbone is not None:
+            model.load_supcon_backbone(supcon_backbone)
+        return model
+    elif model_type == 'crnn':
+        return CRNNModel(config['num_classes'], config.get('dropout', 0.3))
+    elif model_type == 'student':
+        return StudentModel(config['num_classes'])
+    else:
+        raise ValueError(f"Unknown model: {model_type}")
+
+
+# ============================================================
+# TRAINING UTILITIES
+# ============================================================
+class EarlyStopping:
+    def __init__(self, patience=10, mode='max'):
+        self.patience = patience
+        self.mode = mode
+        self.counter = 0
+        self.best_score = None
+        self.best_model_state = None
+    
+    def __call__(self, score, model):
+        better = (self.best_score is None or 
+                  (score > self.best_score if self.mode == 'max' else score < self.best_score))
+        if better:
+            self.best_score = score
+            self.counter = 0
+            self.best_model_state = copy.deepcopy(model.state_dict())
+            return False
+        self.counter += 1
+        return self.counter >= self.patience
+    
+    def load_best_model(self, model):
+        if self.best_model_state:
+            model.load_state_dict(self.best_model_state)
+
+
+def mixup_data(x, y, alpha=0.3, device='cuda'):
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
+    index = torch.randperm(x.size(0), device=device)
+    return lam * x + (1 - lam) * x[index], y, y[index], lam
+
+
+def cutmix_data(x, y, alpha=1.0, device='cuda'):
+    lam = np.random.beta(alpha, alpha)
+    B, C, H, W = x.shape
+    index = torch.randperm(B, device=device)
+    
+    cut_ratio = np.sqrt(1 - lam)
+    cut_h, cut_w = int(H * cut_ratio), int(W * cut_ratio)
+    cy, cx = np.random.randint(H), np.random.randint(W)
+    y1, y2 = np.clip(cy - cut_h//2, 0, H), np.clip(cy + cut_h//2, 0, H)
+    x1, x2 = np.clip(cx - cut_w//2, 0, W), np.clip(cx + cut_w//2, 0, W)
+    
+    x_clone = x.clone()
+    x_clone[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
+    lam = 1 - (y2 - y1) * (x2 - x1) / (H * W)
+    
+    return x_clone, y, y[index], lam
+
+
+def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler,
+                    device, config, is_multistream=False):
+    model.train()
+    total_loss, correct, total = 0, 0, 0
+    
+    for batch in loader:
+        if is_multistream:
+            (x1, x2, x3), y, _ = batch
+            x1, x2, x3 = x1.to(device), x2.to(device), x3.to(device)
+            y = y.to(device)
+            inputs = (x1, x2, x3)
+        else:
+            x, y = batch[0].to(device), batch[1].to(device)
+            
+            # Mixup / CutMix
+            r = random.random()
+            if config.get('cutmix_alpha', 0) > 0 and r < config.get('cutmix_prob', 0.3):
+                x, y_a, y_b, lam = cutmix_data(x, y, config['cutmix_alpha'], device)
+                use_mix = True
+            elif config.get('mixup_alpha', 0) > 0 and r < 0.6:
+                x, y_a, y_b, lam = mixup_data(x, y, config['mixup_alpha'], device)
+                use_mix = True
+            else:
+                use_mix = False
+            inputs = x
+        
+        with autocast(enabled=config['use_amp']):
+            logits = model(inputs)
+            if is_multistream or not use_mix:
+                loss = criterion(logits, y)
+            else:
+                loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
+        
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config['gradient_clip'])
+        scaler.step(optimizer)
+        scaler.update()
+        if scheduler: scheduler.step()
+        
+        total_loss += loss.item() * logits.size(0)
+        preds = logits.argmax(dim=1)
+        if is_multistream or not use_mix:
+            correct += (preds == y).sum().item()
+        else:
+            correct += (lam * (preds == y_a).float() + (1-lam) * (preds == y_b).float()).sum().item()
+        total += logits.size(0)
+    
+    return total_loss / total, correct / total
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device, config, is_multistream=False):
+    model.eval()
+    total_loss, correct, total = 0, 0, 0
+    
+    for batch in loader:
+        if is_multistream:
+            (x1, x2, x3), y, _ = batch
+            x1, x2, x3 = x1.to(device), x2.to(device), x3.to(device)
+            y = y.to(device)
+            inputs = (x1, x2, x3)
+        else:
+            x, y = batch[0].to(device), batch[1].to(device)
+            inputs = x
+        
+        with autocast(enabled=config['use_amp']):
+            logits = model(inputs)
+            loss = criterion(logits, y)
+        
+        total_loss += loss.item() * logits.size(0)
+        correct += (logits.argmax(dim=1) == y).sum().item()
+        total += logits.size(0)
+    
+    return total_loss / total, correct / total
+
+
+# ============================================================
+# PHASE 3: K-FOLD FINE-TUNING
+# ============================================================
+def train_kfold(model_type, train_samples, config, device, best_params=None,
+                supcon_backbone=None):
+    print(f"\n{'='*80}")
+    print(f"TRAINING {model_type.upper()} WITH {config['n_folds']}-FOLD CV")
+    print(f"{'='*80}")
+    
+    train_config = {**config}
+    if best_params:
+        train_config.update(best_params)
+    
+    labels = [s[1] for s in train_samples]
+    sessions = [s[3] for s in train_samples]
+    sgkf = StratifiedGroupKFold(n_splits=config['n_folds'], shuffle=True, random_state=42)
+    
+    is_multistream = (model_type == 'multistream')
+    augmenter = RadarSpecAugment()
+    
+    fold_models = []
+    fold_scores = []
+    
+    for fold, (train_idx, val_idx) in enumerate(sgkf.split(train_samples, labels, sessions)):
+        print(f"\n--- Fold {fold+1}/{config['n_folds']} ---")
+        clear_memory()
+        
+        train_subset = [train_samples[i] for i in train_idx]
+        val_subset = [train_samples[i] for i in val_idx]
+        
+        train_ds = RadarGestureDataset(
+            train_subset, target_frames=config['target_frames'],
+            augment=True, augmenter=augmenter,
+            return_separate_antennas=is_multistream
+        )
+        val_ds = RadarGestureDataset(
+            val_subset, target_frames=config['target_frames'],
+            augment=False, return_separate_antennas=is_multistream
+        )
+        
+        train_loader = DataLoader(train_ds, batch_size=config['batch_size'],
+                                  shuffle=True, num_workers=config['num_workers'],
+                                  pin_memory=True, drop_last=True)
+        val_loader = DataLoader(val_ds, batch_size=config['batch_size'],
+                                shuffle=False, num_workers=config['num_workers'],
+                                pin_memory=True)
+        
+        model = get_model(model_type, train_config, supcon_backbone).to(device)
+        
+        criterion = nn.CrossEntropyLoss(label_smoothing=train_config.get('label_smoothing', 0.1))
+        optimizer = AdamW(model.parameters(), lr=train_config.get('lr', config['finetune_lr']),
+                          weight_decay=train_config.get('weight_decay', 1e-4))
+        
+        total_steps = len(train_loader) * config['finetune_epochs']
+        scheduler = OneCycleLR(optimizer, max_lr=train_config.get('lr', config['finetune_lr']),
+                               total_steps=total_steps, pct_start=0.1)
+        
+        scaler = GradScaler(enabled=config['use_amp'])
+        early_stopping = EarlyStopping(patience=config['early_stopping_patience'], mode='max')
+        
+        best_val_acc = 0
+        
+        pbar = tqdm(range(config['finetune_epochs']), desc=f"Fold {fold+1}")
+        for epoch in pbar:
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, criterion, optimizer, scheduler,
+                scaler, device, train_config, is_multistream
+            )
+            val_loss, val_acc = evaluate(
+                model, val_loader, criterion, device, train_config, is_multistream
+            )
+            
+            best_val_acc = max(best_val_acc, val_acc)
+            pbar.set_postfix({'tr': f'{train_acc*100:.1f}%', 'val': f'{val_acc*100:.1f}%',
+                              'best': f'{best_val_acc*100:.1f}%'})
+            
+            if early_stopping(val_acc, model):
+                print(f"  Early stopping at epoch {epoch+1}")
+                break
+        
+        early_stopping.load_best_model(model)
+        print(f"  Fold {fold+1} Best Val Acc: {best_val_acc*100:.2f}%")
+        
+        model.cpu()
+        fold_models.append((copy.deepcopy(model), best_val_acc))
+        fold_scores.append(best_val_acc)
+        
+        torch.save({'model_state_dict': model.state_dict(), 'val_acc': best_val_acc},
+                   OUTPUT_DIR / f"{model_type}_fold{fold}.pth")
+        
+        del model, optimizer, scheduler, scaler
+        clear_memory()
+    
+    print(f"\n{model_type.upper()} CV: {np.mean(fold_scores)*100:.2f}% ± {np.std(fold_scores)*100:.2f}%")
+    return fold_models
+
+
+# ============================================================
+# BAYESIAN OPTIMIZATION
+# ============================================================
+def optuna_objective(trial, train_samples, config, device):
+    clear_memory()
+    
+    lr = trial.suggest_float('lr', 5e-5, 5e-3, log=True)
+    weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True)
+    dropout = trial.suggest_float('dropout', 0.15, 0.45)
+    mixup_alpha = trial.suggest_float('mixup_alpha', 0.0, 0.5)
+    label_smoothing = trial.suggest_float('label_smoothing', 0.05, 0.2)
+    
+    trial_config = {**config, 'dropout': dropout, 'lr': lr,
+                    'weight_decay': weight_decay, 'mixup_alpha': mixup_alpha,
+                    'label_smoothing': label_smoothing}
+    
+    labels = [s[1] for s in train_samples]
+    sessions = [s[3] for s in train_samples]
+    sgkf = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=42)
+    train_idx, val_idx = next(sgkf.split(train_samples, labels, sessions))
+    
+    train_subset = [train_samples[i] for i in train_idx]
+    val_subset = [train_samples[i] for i in val_idx]
+    
+    augmenter = RadarSpecAugment()
+    train_ds = RadarGestureDataset(train_subset, target_frames=config['target_frames'],
+                                    augment=True, augmenter=augmenter)
+    val_ds = RadarGestureDataset(val_subset, target_frames=config['target_frames'], augment=False)
+    
+    train_loader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True,
+                              num_workers=config['num_workers'], pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=config['batch_size'], shuffle=False,
+                            num_workers=config['num_workers'], pin_memory=True)
+    
+    model = get_model('efficientnet', trial_config).to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=4, T_mult=2, eta_min=1e-7)
+    scaler = GradScaler(enabled=config['use_amp'])
+    
+    best_val_acc = 0
+    for epoch in range(config['optuna_epochs']):
+        train_one_epoch(model, train_loader, criterion, optimizer, None,
+                        scaler, device, trial_config)
+        scheduler.step()
+        _, val_acc = evaluate(model, val_loader, criterion, device, trial_config)
+        best_val_acc = max(best_val_acc, val_acc)
+        trial.report(val_acc, epoch)
+        if trial.should_prune():
+            del model, optimizer, scheduler, scaler
+            clear_memory()
+            raise optuna.TrialPruned()
+    
+    del model, optimizer, scheduler, scaler
+    clear_memory()
+    return best_val_acc
+
+
+def run_bayesian_optimization(train_samples, config, device):
+    print("\n" + "="*80)
+    print("BAYESIAN HYPERPARAMETER OPTIMIZATION")
+    print("="*80)
+    
+    study = optuna.create_study(direction='maximize',
+                                sampler=TPESampler(seed=42),
+                                pruner=optuna.pruners.MedianPruner(n_startup_trials=5))
+    study.optimize(lambda t: optuna_objective(t, train_samples, config, device),
+                   n_trials=config['n_optuna_trials'], show_progress_bar=True, gc_after_trial=True)
+    
+    print(f"\nBest trial: {study.best_trial.value:.4f}")
+    for k, v in study.best_trial.params.items():
+        print(f"  {k}: {v}")
+    
+    with open(OUTPUT_DIR / "optuna_best_params.json", 'w') as f:
+        json.dump(study.best_trial.params, f, indent=2)
+    
+    return study.best_trial.params
+
+
+# ============================================================
+# PHASE 4: TEACHER ENSEMBLE
+# ============================================================
+class TeacherEnsemble:
+    def __init__(self, models_and_types):
+        """models_and_types: list of (model, model_type, val_acc)"""
+        self.models = [(m.cpu(), mt) for m, mt, _ in models_and_types]
+        self.weights = [acc for _, _, acc in models_and_types]
+        total_w = sum(self.weights)
+        self.weights = [w / total_w for w in self.weights]
+    
+    @torch.no_grad()
+    def get_soft_labels(self, loader, device, config, temperature=4.0):
+        all_ids, all_soft = [], []
+        
+        for batch in tqdm(loader, desc="Generating soft labels"):
+            x = batch[0].to(device)
+            sample_ids = batch[-1]
+            
+            weighted_logits = None
+            for (model, mt), weight in zip(self.models, self.weights):
+                model.to(device).eval()
+                with autocast(enabled=config['use_amp']):
+                    logits = model(x)
+                if weighted_logits is None:
+                    weighted_logits = weight * logits
+                else:
+                    weighted_logits += weight * logits
+                model.cpu()
+                clear_memory()
+            
+            soft = F.softmax(weighted_logits / temperature, dim=1)
+            all_soft.append(soft.cpu().numpy())
+            all_ids.extend(sample_ids.numpy() if torch.is_tensor(sample_ids) else sample_ids)
+        
+        return all_ids, np.concatenate(all_soft, axis=0)
+    
+    @torch.no_grad()
+    def predict(self, loader, device, config, use_tta=True):
+        all_ids, all_logits = [], []
+        
+        for batch in tqdm(loader, desc="Ensemble predicting"):
+            x = batch[0].to(device)
+            sample_ids = batch[-1]
+            
+            weighted_logits = None
+            for (model, mt), weight in zip(self.models, self.weights):
+                model.to(device).eval()
+                with autocast(enabled=config['use_amp']):
+                    logits = model(x)
+                    if use_tta:
+                        logits += model(x.flip(-1))
+                        logits += model(x.flip(-2))
+                        logits /= 3
+                if weighted_logits is None:
+                    weighted_logits = weight * logits
+                else:
+                    weighted_logits += weight * logits
+                model.cpu()
+                clear_memory()
+            
+            all_logits.append(weighted_logits.cpu())
+            all_ids.extend(sample_ids.numpy() if torch.is_tensor(sample_ids) else sample_ids)
+        
+        all_logits = torch.cat(all_logits, dim=0)
+        return all_ids, all_logits.argmax(dim=1).numpy(), all_logits
+
+
+# ============================================================
+# PHASE 5: KNOWLEDGE DISTILLATION
+# ============================================================
+def train_student_distillation(train_samples, soft_labels, config, best_params, device):
+    print("\n" + "="*80)
+    print("PHASE 5: KNOWLEDGE DISTILLATION")
+    print("="*80)
+    
+    clear_memory()
+    train_config = {**config, **best_params}
+    
+    n_val = int(0.1 * len(train_samples))
+    indices = list(range(len(train_samples)))
+    random.shuffle(indices)
+    
+    train_subset = [train_samples[i] for i in indices[n_val:]]
+    val_subset = [train_samples[i] for i in indices[:n_val]]
+    train_soft = soft_labels[indices[n_val:]]
+    val_soft = soft_labels[indices[:n_val]]
+    
+    train_ds = RadarGestureDataset(train_subset, target_frames=config['target_frames'],
+                                    augment=True, soft_labels=train_soft, mode='distillation')
+    val_ds = RadarGestureDataset(val_subset, target_frames=config['target_frames'],
+                                  augment=False, soft_labels=val_soft, mode='distillation')
+    
+    train_loader = DataLoader(train_ds, batch_size=config['batch_size'],
+                              shuffle=True, num_workers=config['num_workers'],
+                              pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=config['batch_size'],
+                            shuffle=False, num_workers=config['num_workers'],
+                            pin_memory=True)
+    
+    student = get_model('student', train_config).to(device)
+    
+    optimizer = AdamW(student.parameters(), lr=train_config.get('lr', 5e-4) * 0.5,
+                      weight_decay=train_config.get('weight_decay', 1e-4))
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-7)
+    scaler = GradScaler(enabled=config['use_amp'])
+    early_stopping = EarlyStopping(patience=config['early_stopping_patience'], mode='max')
+    
+    T = config['distill_temperature']
+    alpha = config['distill_alpha']
+    best_val_acc = 0
+    
+    for epoch in tqdm(range(config['distill_epochs']), desc="Distillation"):
+        student.train()
+        for x, y, soft_y, _ in train_loader:
+            x, y, soft_y = x.to(device), y.to(device), soft_y.to(device)
+            
+            with autocast(enabled=config['use_amp']):
+                logits = student(x)
+                hard_loss = F.cross_entropy(logits, y)
+                soft_loss = F.kl_div(F.log_softmax(logits / T, dim=1), soft_y,
+                                     reduction='batchmean') * (T ** 2)
+                loss = alpha * soft_loss + (1 - alpha) * hard_loss
+            
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(student.parameters(), config['gradient_clip'])
+            scaler.step(optimizer)
+            scaler.update()
+        
+        scheduler.step()
+        
+        student.eval()
+        val_correct, val_total = 0, 0
+        with torch.no_grad():
+            for x, y, _, _ in val_loader:
+                x, y = x.to(device), y.to(device)
+                logits = student(x)
+                val_correct += (logits.argmax(dim=1) == y).sum().item()
+                val_total += x.size(0)
+        
+        val_acc = val_correct / val_total
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({'model_state_dict': student.state_dict()}, OUTPUT_DIR / "student_best.pth")
+        
+        if early_stopping(val_acc, student):
+            break
+    
+    early_stopping.load_best_model(student)
+    print(f"\nStudent Best Val Acc: {best_val_acc*100:.2f}%")
+    return student
+
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+def main():
+    print("\n" + "="*80)
+    print("DREAM GPU PIPELINE — FULL EXECUTION")
+    print("="*80)
+    
+    # ========== PHASE 1: MAE Pretraining ==========
+    mae_encoder = train_mae(train_samples, CONFIG, device)
+    
+    # ========== PHASE 2: SupCon Pretraining ==========
+    supcon_backbone_state = train_supcon(train_samples, CONFIG, device)
+    supcon_backbone_dict = copy.deepcopy(supcon_backbone_state.state_dict())
+    del supcon_backbone_state
+    clear_memory()
+    
+    # ========== Bayesian Optimization ==========
+    best_params = run_bayesian_optimization(train_samples, CONFIG, device)
+    
+    # ========== PHASE 3: Train All Architectures ==========
+    all_teacher_info = []  # (model, model_type, val_acc)
+    
+    # 3A: EfficientNet-B4 with SupCon backbone
+    eff_models = train_kfold('efficientnet', train_samples, CONFIG, device,
+                              best_params, supcon_backbone_dict)
+    for m, acc in eff_models:
+        all_teacher_info.append((m, 'efficientnet', acc))
+    
+    # 3B: AST
+    ast_models = train_kfold('ast', train_samples, CONFIG, device, best_params)
+    for m, acc in ast_models:
+        all_teacher_info.append((m, 'ast', acc))
+    
+    # 3C: CRNN
+    crnn_models = train_kfold('crnn', train_samples, CONFIG, device, best_params)
+    for m, acc in crnn_models:
+        all_teacher_info.append((m, 'crnn', acc))
+    
+    # 3D: Multi-Stream Cross-Attention
+    ms_models = train_kfold('multistream', train_samples, CONFIG, device, best_params)
+    for m, acc in ms_models:
+        all_teacher_info.append((m, 'multistream', acc))
+    
+    print(f"\nTotal teacher models: {len(all_teacher_info)}")
+    
+    # ========== PHASE 4: Teacher Ensemble ==========
+    print("\n" + "="*80)
+    print("PHASE 4: TEACHER ENSEMBLE")
+    print("="*80)
+    
+    # Filter to only non-multistream for soft label generation (they use standard input)
+    standard_teachers = [(m, mt, acc) for m, mt, acc in all_teacher_info if mt != 'multistream']
+    teacher_ensemble = TeacherEnsemble(standard_teachers)
+    
+    full_train_ds = RadarGestureDataset(train_samples, target_frames=CONFIG['target_frames'], augment=False)
+    full_train_loader = DataLoader(full_train_ds, batch_size=CONFIG['batch_size'],
+                                    shuffle=False, num_workers=CONFIG['num_workers'], pin_memory=True)
+    
+    _, soft_labels = teacher_ensemble.get_soft_labels(
+        full_train_loader, device, CONFIG, CONFIG['distill_temperature'])
+    np.save(OUTPUT_DIR / "soft_labels.npy", soft_labels)
+    print(f"Soft labels: {soft_labels.shape}")
+    
+    # ========== PHASE 5: Knowledge Distillation ==========
+    student = train_student_distillation(train_samples, soft_labels, CONFIG, best_params, device)
+    
+    # ========== PHASE 6: Generate Predictions ==========
+    print("\n" + "="*80)
+    print("PHASE 6: GENERATING PREDICTIONS")
+    print("="*80)
+    
+    comp_val_ds = RadarGestureDataset(val_samples, target_frames=CONFIG['target_frames'],
+                                       augment=False, is_test=True)
+    comp_test_ds = RadarGestureDataset(test_samples, target_frames=CONFIG['target_frames'],
+                                        augment=False, is_test=True)
+    
+    comp_val_loader = DataLoader(comp_val_ds, batch_size=CONFIG['batch_size'],
+                                  shuffle=False, num_workers=CONFIG['num_workers'], pin_memory=True)
+    comp_test_loader = DataLoader(comp_test_ds, batch_size=CONFIG['batch_size'],
+                                   shuffle=False, num_workers=CONFIG['num_workers'], pin_memory=True)
+    
+    # Student predictions (fast, real-time)
+    print("\nStudent predictions...")
+    student.to(device).eval()
+    
+    student_val_ids, student_val_preds, _ = [], [], None
+    with torch.no_grad():
+        for batch in tqdm(comp_val_loader, desc="Student Val"):
+            x = batch[0].to(device)
+            with autocast(enabled=CONFIG['use_amp']):
+                logits = student(x)
+                logits += student(x.flip(-1))
+                logits += student(x.flip(-2))
+                logits /= 3
+            student_val_preds.extend(logits.argmax(dim=1).cpu().numpy())
+            student_val_ids.extend(batch[-1].numpy() if torch.is_tensor(batch[-1]) else batch[-1])
+    
+    student_test_ids, student_test_preds = [], []
+    with torch.no_grad():
+        for batch in tqdm(comp_test_loader, desc="Student Test"):
+            x = batch[0].to(device)
+            with autocast(enabled=CONFIG['use_amp']):
+                logits = student(x)
+                logits += student(x.flip(-1))
+                logits += student(x.flip(-2))
+                logits /= 3
+            student_test_preds.extend(logits.argmax(dim=1).cpu().numpy())
+            student_test_ids.extend(batch[-1].numpy() if torch.is_tensor(batch[-1]) else batch[-1])
+    
+    sub_student = pd.DataFrame({
+        'id': student_val_ids + student_test_ids,
+        'Pred': student_val_preds + student_test_preds
+    }).sort_values('id').reset_index(drop=True)
+    sub_student.to_csv(OUTPUT_DIR / "submission_student.csv", index=False)
+    print(f"  Student submission: {len(sub_student)} rows")
+    
+    # Ensemble predictions (highest accuracy)
+    print("\nEnsemble predictions...")
+    val_ids_e, val_preds_e, _ = teacher_ensemble.predict(comp_val_loader, device, CONFIG, use_tta=True)
+    test_ids_e, test_preds_e, _ = teacher_ensemble.predict(comp_test_loader, device, CONFIG, use_tta=True)
+    
+    sub_ensemble = pd.DataFrame({
+        'id': list(val_ids_e) + list(test_ids_e),
+        'Pred': list(val_preds_e) + list(test_preds_e)
+    }).sort_values('id').reset_index(drop=True)
+    sub_ensemble.to_csv(OUTPUT_DIR / "submission_ensemble.csv", index=False)
+    print(f"  Ensemble submission: {len(sub_ensemble)} rows")
+    
+    # ========== FINAL SUMMARY ==========
+    print("\n" + "="*80)
+    print("DREAM GPU PIPELINE COMPLETE")
+    print("="*80)
+    print(f"\nOutput: {OUTPUT_DIR}")
+    print(f"\nPhases completed:")
+    print(f"  1. MAE Pretraining: ✓")
+    print(f"  2. SupCon Pretraining: ✓")
+    print(f"  3. Multi-Architecture Fine-Tuning: ✓")
+    print(f"     - EfficientNet-B4 (SupCon backbone): {len(eff_models)} folds")
+    print(f"     - AST: {len(ast_models)} folds")
+    print(f"     - CRNN: {len(crnn_models)} folds")
+    print(f"     - Multi-Stream Cross-Attention: {len(ms_models)} folds")
+    print(f"  4. Teacher Ensemble: {len(standard_teachers)} models")
+    print(f"  5. Knowledge Distillation: ✓")
+    print(f"  6. Submissions Generated: ✓")
+    print(f"\nSubmissions:")
+    print(f"  submission_student.csv  — Fast inference (real-time)")
+    print(f"  submission_ensemble.csv — Maximum accuracy")
+    print("="*80)
+    
+    return student, teacher_ensemble
+
+
+# ============================================================
+# RUN
+# ============================================================
+if __name__ == "__main__":
+    student_model, teacher_ensemble = main()
