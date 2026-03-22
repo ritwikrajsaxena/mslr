@@ -1,0 +1,1202 @@
+# ============================================================
+# BALANCED RADAR SIGN LANGUAGE ENSEMBLE
+# Optimized for RTX 3070 8GB - Better Accuracy
+# ============================================================
+
+import os
+os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import gc
+import re
+import sys
+import json
+import math
+import time
+import random
+import shutil
+import copy
+import traceback
+import warnings
+from pathlib import Path
+from datetime import datetime
+from collections import Counter
+from typing import List, Tuple, Dict, Any, Optional
+
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
+from torch.cuda.amp import autocast, GradScaler
+
+import timm
+import torchvision.models.video as video_models
+from tqdm.auto import tqdm
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import accuracy_score, f1_score, top_k_accuracy_score
+
+# ============================================================
+# CONFIGURATION - BALANCED FOR ACCURACY + MEMORY
+# ============================================================
+class Config:
+    """Balanced configuration using available VRAM headroom."""
+    
+    # Mode
+    dry_run = False
+    
+    # Paths - MODIFY THIS
+    root_dir = Path("/home/rsnfh/Downloads/CVPR MSLR 2026 Track 2")
+    output_dir = root_dir / "Ensemble_Output"
+    checkpoint_dir = root_dir / "Checkpoints"
+    
+    # Data - Balanced for accuracy
+    num_classes = 126
+    target_frames = 32          # Enough temporal context
+    range_bins = 256
+    img_size = 160              # Better for pretrained models
+    video_size = 80
+    channels = ["RTM1", "RTM2", "RTM3"]
+    
+    # Training
+    n_folds = 3
+    epochs = 50
+    early_stopping_patience = 10
+    
+    # Batch sizes - Using available headroom
+    batch_size_2d = 8
+    batch_size_3d = 4
+    batch_size_infer = 16
+    accumulation_steps = 4
+    
+    # Optimizer
+    learning_rate = 3e-4
+    min_lr = 1e-6
+    weight_decay = 1e-4
+    warmup_pct = 0.05
+    
+    # Regularization
+    dropout = 0.4
+    mixup_alpha = 0.3
+    cutmix_prob = 0.2
+    label_smoothing = 0.1
+    gradient_clip = 1.0
+    
+    # Augmentation
+    aug_prob = 0.6
+    time_mask_max = 8
+    freq_mask_max = 30
+    
+    # Model architecture
+    pretrained = True
+    proj_dim = 384
+    
+    # Temporal model
+    lstm_hidden = 384
+    lstm_layers = 2
+    transformer_heads = 8
+    transformer_layers = 3
+    
+    # Experts
+    experts = ["efficientnet", "swin", "r3d"]
+    
+    # Pseudo-labeling
+    enable_pseudo_labeling = True
+    pseudo_confidence_threshold = 0.85
+    pseudo_min_vote_agreement = 2
+    
+    # Hardware
+    num_workers = 4
+    pin_memory = True
+    enable_amp = True
+    
+    seed = 42
+
+cfg = Config()
+
+# ============================================================
+# SETUP & MEMORY MANAGEMENT
+# ============================================================
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except:
+            pass
+
+def clear_memory(verbose: bool = False):
+    gc.collect()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        try:
+            torch.cuda.synchronize()
+        except:
+            pass
+        torch.cuda.reset_peak_memory_stats()
+        if verbose:
+            allocated = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            print(f"  GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
+def print_memory_stats(prefix: str = ""):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        peak = torch.cuda.max_memory_allocated() / 1e9
+        print(f"{prefix}GPU: {allocated:.2f}GB allocated (Peak: {peak:.2f}GB)")
+
+def delete_model_safely(model, optimizer=None, scheduler=None, scaler=None):
+    if model is not None:
+        try:
+            model.cpu()
+        except:
+            pass
+        for param in model.parameters():
+            param.grad = None
+        del model
+    if optimizer is not None:
+        optimizer.zero_grad(set_to_none=True)
+        optimizer.state.clear()
+        del optimizer
+    if scheduler is not None:
+        del scheduler
+    if scaler is not None:
+        del scaler
+    clear_memory()
+
+def get_device():
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        props = torch.cuda.get_device_properties(0)
+        print(f"🚀 GPU: {props.name} | Memory: {props.total_memory / 1e9:.1f} GB")
+    else:
+        device = torch.device("cpu")
+        print("⚠️ Using CPU")
+    return device
+
+# Initialize
+set_seed(cfg.seed)
+device = get_device()
+cfg.output_dir.mkdir(parents=True, exist_ok=True)
+cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+amp_enabled = cfg.enable_amp and device.type == "cuda"
+
+print("\n" + "=" * 60)
+print("BALANCED RADAR SIGN LANGUAGE ENSEMBLE")
+print("=" * 60)
+print(f"Target Frames: {cfg.target_frames} | Image Size: {cfg.img_size}")
+print(f"Batch Size 2D/3D: {cfg.batch_size_2d}/{cfg.batch_size_3d}")
+print(f"Accumulation: {cfg.accumulation_steps} | LR: {cfg.learning_rate}")
+print(f"Experts: {cfg.experts}")
+print("=" * 60 + "\n")
+
+# ============================================================
+# UTILITIES
+# ============================================================
+class AverageMeter:
+    def __init__(self):
+        self.reset()
+    def reset(self):
+        self.val = self.avg = self.sum = self.count = 0
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count if self.count > 0 else 0
+
+def first_int(text, default=-1):
+    match = re.search(r"-?\d+", str(text))
+    return int(match.group()) if match else default
+
+def format_time(seconds):
+    h, m, s = int(seconds // 3600), int((seconds % 3600) // 60), int(seconds % 60)
+    return f"{h}h {m}m" if h > 0 else (f"{m}m {s}s" if m > 0 else f"{s}s")
+
+# ============================================================
+# ENHANCED DATA AUGMENTATION
+# ============================================================
+class RadarAugmentation:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.p = cfg.aug_prob
+    
+    def _apply(self, p=None):
+        return random.random() < (p if p else self.p)
+    
+    def time_mask(self, x):
+        if not self._apply():
+            return x
+        x = x.copy()
+        T = x.shape[0]
+        for _ in range(random.randint(1, 2)):
+            mask_len = random.randint(1, min(self.cfg.time_mask_max, T // 4))
+            start = random.randint(0, max(0, T - mask_len))
+            x[start:start + mask_len, :] = 0
+        return x
+    
+    def freq_mask(self, x):
+        if not self._apply():
+            return x
+        x = x.copy()
+        R = x.shape[1]
+        for _ in range(random.randint(1, 2)):
+            mask_len = random.randint(1, min(self.cfg.freq_mask_max, R // 4))
+            start = random.randint(0, max(0, R - mask_len))
+            x[:, start:start + mask_len] = 0
+        return x
+    
+    def add_noise(self, x):
+        if not self._apply(0.4):
+            return x
+        noise_level = random.uniform(0.02, 0.08)
+        noise = np.random.randn(*x.shape).astype(np.float32) * noise_level
+        return x + noise
+    
+    def time_warp(self, x):
+        if not self._apply(0.3):
+            return x
+        T, R = x.shape
+        scale = random.uniform(0.85, 1.15)
+        new_T = max(8, int(T * scale))
+        t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
+        t = F.interpolate(t, size=(new_T, R), mode="bilinear", align_corners=False)
+        t = F.interpolate(t, size=(T, R), mode="bilinear", align_corners=False)
+        return t.squeeze().numpy()
+    
+    def horizontal_flip(self, x):
+        if not self._apply(0.3):
+            return x
+        return np.flip(x, axis=1).copy()
+    
+    def vertical_shift(self, x):
+        if not self._apply(0.3):
+            return x
+        shift = random.randint(-10, 10)
+        return np.roll(x, shift, axis=1)
+    
+    def __call__(self, x):
+        x = self.time_warp(x)
+        x = self.time_mask(x)
+        x = self.freq_mask(x)
+        x = self.add_noise(x)
+        x = self.horizontal_flip(x)
+        x = self.vertical_shift(x)
+        return x
+
+# ============================================================
+# DATASET
+# ============================================================
+class RadarDataset(Dataset):
+    def __init__(self, samples, cfg, augment=False, is_test=False):
+        self.samples = samples
+        self.cfg = cfg
+        self.augment = augment
+        self.is_test = is_test
+        self.aug = RadarAugmentation(cfg) if augment else None
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def _load_channel(self, sample_dir, ch):
+        files = sorted(sample_dir.glob(f"*_{ch}.npy"))
+        if files:
+            return np.load(files[0]).astype(np.float32)
+        return np.zeros((64, self.cfg.range_bins), dtype=np.float32)
+    
+    def _resize(self, x):
+        T, R = x.shape
+        if T == self.cfg.target_frames and R == self.cfg.range_bins:
+            return x
+        t = torch.from_numpy(x).float().unsqueeze(0).unsqueeze(0)
+        t = F.interpolate(t, size=(self.cfg.target_frames, self.cfg.range_bins), 
+                         mode="bilinear", align_corners=False)
+        return t.squeeze().numpy()
+    
+    def _normalize(self, x):
+        mean, std = x.mean(), x.std()
+        return (x - mean) / (std + 1e-8)
+    
+    def __getitem__(self, idx):
+        sample_dir, label, sample_id, group_id = self.samples[idx]
+        channels = []
+        for ch in self.cfg.channels:
+            data = self._load_channel(sample_dir, ch)
+            data = self._resize(data)
+            if self.augment and self.aug:
+                data = self.aug(data)
+            data = self._normalize(data)
+            channels.append(data)
+        
+        x = torch.tensor(np.stack(channels), dtype=torch.float32)
+        y = torch.tensor(-1 if self.is_test else label, dtype=torch.long)
+        return {"rtm": x, "label": y, "sample_id": sample_id, "group_id": group_id}
+
+# ============================================================
+# DATA LOADING
+# ============================================================
+def scan_dataset(folder, labeled=True):
+    samples = []
+    if not folder.exists():
+        return samples
+    for cls_dir in sorted(folder.iterdir()):
+        if not cls_dir.is_dir():
+            continue
+        label = first_int(cls_dir.name, -1) if labeled else -1
+        if labeled and (label < 0 or label >= cfg.num_classes):
+            continue
+        for sample_dir in sorted(cls_dir.iterdir()):
+            if sample_dir.is_dir() and any(sample_dir.glob("*.npy")):
+                sid = first_int(sample_dir.name, len(samples))
+                samples.append((sample_dir, label, sid, sid))
+    return samples
+
+def load_data(cfg):
+    print("Loading dataset...")
+    train_samples = scan_dataset(cfg.root_dir / "train", labeled=True)
+    val_samples = scan_dataset(cfg.root_dir / "val", labeled=False)
+    test_samples = scan_dataset(cfg.root_dir / "test", labeled=False)
+    print(f"  Train: {len(train_samples)}, Val: {len(val_samples)}, Test: {len(test_samples)}")
+    if len(train_samples) == 0:
+        raise ValueError("No training samples found!")
+    labels = [s[1] for s in train_samples]
+    print(f"  Classes: {len(set(labels))}")
+    return train_samples, val_samples, test_samples
+
+def get_class_weights(labels, num_classes):
+    counts = Counter(labels)
+    total = len(labels)
+    weights = []
+    for i in range(num_classes):
+        count = counts.get(i, 0)
+        weights.append(total / (num_classes * count) if count > 0 else 1.0)
+    return torch.tensor(weights, dtype=torch.float32)
+
+# ============================================================
+# TEMPORAL MODELS
+# ============================================================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=512, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+    
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+class TemporalLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim=384, num_layers=2, num_classes=126, dropout=0.4):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, 
+                           batch_first=True, bidirectional=True, 
+                           dropout=dropout if num_layers > 1 else 0)
+        
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes)
+        )
+    
+    def forward(self, x):
+        out, _ = self.lstm(x)  # [B, T, hidden*2]
+        
+        # Attention pooling
+        attn_weights = self.attention(out)  # [B, T, 1]
+        attn_weights = F.softmax(attn_weights, dim=1)
+        context = torch.sum(out * attn_weights, dim=1)  # [B, hidden*2]
+        
+        return self.classifier(context)
+
+class TemporalTransformer(nn.Module):
+    def __init__(self, input_dim, num_heads=8, num_layers=3, num_classes=126, dropout=0.4):
+        super().__init__()
+        self.pos_encoder = PositionalEncoding(input_dim, dropout=dropout)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=input_dim, nhead=num_heads,
+            dim_feedforward=input_dim * 4,
+            dropout=dropout, activation='gelu', batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # CLS token
+        self.cls_token = nn.Parameter(torch.randn(1, 1, input_dim) * 0.02)
+        
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, num_classes)
+        )
+    
+    def forward(self, x):
+        B = x.size(0)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = self.pos_encoder(x)
+        x = self.transformer(x)
+        return self.classifier(x[:, 0])
+
+# ============================================================
+# EXPERT MODELS
+# ============================================================
+class EfficientNetExpert(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        
+        # Use EfficientNet-B2 for better capacity
+        self.backbone = timm.create_model(
+            "efficientnet_b2", pretrained=cfg.pretrained, num_classes=0, in_chans=3
+        )
+        feat_dim = self.backbone.num_features  # 1408 for B2
+        
+        self.proj = nn.Sequential(
+            nn.Linear(feat_dim, cfg.proj_dim),
+            nn.LayerNorm(cfg.proj_dim),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+        
+        self.temporal = TemporalLSTM(
+            cfg.proj_dim, cfg.lstm_hidden, cfg.lstm_layers, cfg.num_classes, cfg.dropout
+        )
+    
+    def forward(self, x):
+        B, C, T, R = x.shape
+        
+        # Process all frames at once (no chunking - we have memory)
+        x = x.permute(0, 2, 1, 3).reshape(B * T, C, R)  # [B*T, C, R]
+        x = x.unsqueeze(-1).expand(-1, -1, -1, self.cfg.img_size)  # [B*T, C, R, img_size]
+        x = F.interpolate(x, size=(self.cfg.img_size, self.cfg.img_size), 
+                         mode="bilinear", align_corners=False)
+        
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            feats = self.backbone(x)  # [B*T, feat_dim]
+            feats = self.proj(feats)  # [B*T, proj_dim]
+        
+        feats = feats.reshape(B, T, -1)  # [B, T, proj_dim]
+        return self.temporal(feats)
+
+class SwinExpert(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        
+        self.backbone = timm.create_model(
+            "swin_tiny_patch4_window7_224", pretrained=cfg.pretrained, num_classes=0, in_chans=3
+        )
+        feat_dim = self.backbone.num_features  # 768
+        
+        self.proj = nn.Sequential(
+            nn.Linear(feat_dim, cfg.proj_dim),
+            nn.LayerNorm(cfg.proj_dim),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+        
+        self.temporal = TemporalTransformer(
+            cfg.proj_dim, cfg.transformer_heads, cfg.transformer_layers, 
+            cfg.num_classes, cfg.dropout
+        )
+    
+    def forward(self, x):
+        B, C, T, R = x.shape
+        
+        x = x.permute(0, 2, 1, 3).reshape(B * T, C, R)
+        x = x.unsqueeze(-1).expand(-1, -1, -1, self.cfg.img_size)
+        x = F.interpolate(x, size=(self.cfg.img_size, self.cfg.img_size),
+                         mode="bilinear", align_corners=False)
+        
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            feats = self.backbone(x)
+            feats = self.proj(feats)
+        
+        feats = feats.reshape(B, T, -1)
+        return self.temporal(feats)
+
+class R3DExpert(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        
+        try:
+            weights = video_models.R3D_18_Weights.DEFAULT if cfg.pretrained else None
+            self.backbone = video_models.r3d_18(weights=weights)
+        except:
+            self.backbone = video_models.r3d_18(pretrained=cfg.pretrained)
+        
+        feat_dim = self.backbone.fc.in_features  # 512
+        self.backbone.fc = nn.Identity()
+        
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(feat_dim, cfg.proj_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.proj_dim, cfg.num_classes)
+        )
+    
+    def forward(self, x):
+        B, C, T, R = x.shape
+        x = x.unsqueeze(-1).expand(-1, -1, -1, -1, self.cfg.video_size)
+        x = F.interpolate(x, size=(T, self.cfg.video_size, self.cfg.video_size),
+                         mode="trilinear", align_corners=False)
+        feats = self.backbone(x)
+        return self.classifier(feats)
+
+class MC3Expert(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        
+        try:
+            weights = video_models.MC3_18_Weights.DEFAULT if cfg.pretrained else None
+            self.backbone = video_models.mc3_18(weights=weights)
+        except:
+            self.backbone = video_models.mc3_18(pretrained=cfg.pretrained)
+        
+        feat_dim = self.backbone.fc.in_features
+        self.backbone.fc = nn.Identity()
+        
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(feat_dim, cfg.proj_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.proj_dim, cfg.num_classes)
+        )
+    
+    def forward(self, x):
+        B, C, T, R = x.shape
+        x = x.unsqueeze(-1).expand(-1, -1, -1, -1, self.cfg.video_size)
+        x = F.interpolate(x, size=(T, self.cfg.video_size, self.cfg.video_size),
+                         mode="trilinear", align_corners=False)
+        feats = self.backbone(x)
+        return self.classifier(feats)
+
+class R2Plus1DExpert(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        
+        try:
+            weights = video_models.R2Plus1D_18_Weights.DEFAULT if cfg.pretrained else None
+            self.backbone = video_models.r2plus1d_18(weights=weights)
+        except:
+            self.backbone = video_models.r2plus1d_18(pretrained=cfg.pretrained)
+        
+        feat_dim = self.backbone.fc.in_features
+        self.backbone.fc = nn.Identity()
+        
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(feat_dim, cfg.proj_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.proj_dim, cfg.num_classes)
+        )
+    
+    def forward(self, x):
+        B, C, T, R = x.shape
+        x = x.unsqueeze(-1).expand(-1, -1, -1, -1, self.cfg.video_size)
+        x = F.interpolate(x, size=(T, self.cfg.video_size, self.cfg.video_size),
+                         mode="trilinear", align_corners=False)
+        feats = self.backbone(x)
+        return self.classifier(feats)
+
+def get_expert(name, cfg):
+    experts = {
+        "efficientnet": EfficientNetExpert,
+        "swin": SwinExpert,
+        "r3d": R3DExpert,
+        "mc3": MC3Expert,
+        "r2plus1d": R2Plus1DExpert,
+    }
+    if name not in experts:
+        raise ValueError(f"Unknown expert: {name}")
+    return experts[name](cfg)
+
+# ============================================================
+# EARLY STOPPING
+# ============================================================
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+        self.best_epoch = 0
+        self.best_state = None
+    
+    def __call__(self, score, model, epoch):
+        if self.best_score is None or score > self.best_score + self.min_delta:
+            self.best_score = score
+            self.best_epoch = epoch
+            self.counter = 0
+            self.best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            return False
+        self.counter += 1
+        return self.counter >= self.patience
+    
+    def load_best(self, model):
+        if self.best_state:
+            model.load_state_dict(self.best_state)
+
+# ============================================================
+# TRAINING FUNCTIONS
+# ============================================================
+def mixup_data(x, y, alpha=0.3):
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    lam = max(lam, 1 - lam)  # Ensure lam >= 0.5
+    idx = torch.randperm(x.size(0), device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[idx]
+    return mixed_x, y, y[idx], lam
+
+def cutmix_data(x, y, alpha=1.0):
+    lam = np.random.beta(alpha, alpha)
+    B, C, T, R = x.size()
+    
+    # Random box
+    cut_rat = np.sqrt(1. - lam)
+    cut_t = int(T * cut_rat)
+    cut_r = int(R * cut_rat)
+    
+    ct = np.random.randint(T)
+    cr = np.random.randint(R)
+    
+    t1 = np.clip(ct - cut_t // 2, 0, T)
+    t2 = np.clip(ct + cut_t // 2, 0, T)
+    r1 = np.clip(cr - cut_r // 2, 0, R)
+    r2 = np.clip(cr + cut_r // 2, 0, R)
+    
+    idx = torch.randperm(B, device=x.device)
+    x_cut = x.clone()
+    x_cut[:, :, t1:t2, r1:r2] = x[idx, :, t1:t2, r1:r2]
+    
+    lam = 1 - ((t2 - t1) * (r2 - r1) / (T * R))
+    
+    return x_cut, y, y[idx], lam
+
+def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, cfg, device, epoch):
+    model.train()
+    loss_meter = AverageMeter()
+    acc_meter = AverageMeter()
+    
+    optimizer.zero_grad(set_to_none=True)
+    pbar = tqdm(loader, desc=f"Train Epoch {epoch}", leave=False)
+    
+    for batch_idx, batch in enumerate(pbar):
+        x = batch["rtm"].to(device, non_blocking=True)
+        y = batch["label"].to(device, non_blocking=True)
+        
+        # Augmentation selection
+        aug_type = random.random()
+        
+        if aug_type < 0.3 and x.size(0) > 1:  # Mixup 30%
+            x, ya, yb, lam = mixup_data(x, y, cfg.mixup_alpha)
+            with autocast(enabled=amp_enabled):
+                logits = model(x)
+                loss = lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
+            pred = logits.argmax(dim=1)
+            acc = (lam * (pred == ya).float() + (1 - lam) * (pred == yb).float()).mean()
+            
+        elif aug_type < 0.45 and x.size(0) > 1:  # CutMix 15%
+            x, ya, yb, lam = cutmix_data(x, y)
+            with autocast(enabled=amp_enabled):
+                logits = model(x)
+                loss = lam * criterion(logits, ya) + (1 - lam) * criterion(logits, yb)
+            pred = logits.argmax(dim=1)
+            acc = (lam * (pred == ya).float() + (1 - lam) * (pred == yb).float()).mean()
+            
+        else:  # Normal
+            with autocast(enabled=amp_enabled):
+                logits = model(x)
+                loss = criterion(logits, y)
+            pred = logits.argmax(dim=1)
+            acc = (pred == y).float().mean()
+        
+        # Gradient accumulation
+        loss_scaled = loss / cfg.accumulation_steps
+        scaler.scale(loss_scaled).backward()
+        
+        if ((batch_idx + 1) % cfg.accumulation_steps == 0) or ((batch_idx + 1) == len(loader)):
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            if scheduler is not None:
+                scheduler.step()
+        
+        loss_meter.update(loss.item(), x.size(0))
+        acc_meter.update(acc.item(), x.size(0))
+        pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", acc=f"{acc_meter.avg*100:.1f}%")
+        
+        del x, y, logits, loss, pred
+    
+    return {"train_loss": loss_meter.avg, "train_acc": acc_meter.avg}
+
+@torch.no_grad()
+def validate(model, loader, criterion, cfg, device):
+    model.eval()
+    all_preds, all_labels, all_probs = [], [], []
+    total_loss, total_samples = 0.0, 0
+    
+    for batch in tqdm(loader, desc="Validation", leave=False):
+        x = batch["rtm"].to(device, non_blocking=True)
+        y = batch["label"].to(device, non_blocking=True)
+        
+        with autocast(enabled=amp_enabled):
+            logits = model(x)
+            loss = criterion(logits, y)
+        
+        probs = F.softmax(logits, dim=1)
+        preds = logits.argmax(dim=1)
+        
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(y.cpu().numpy())
+        all_probs.extend(probs.cpu().numpy())
+        total_loss += loss.item() * x.size(0)
+        total_samples += x.size(0)
+        
+        del x, y, logits, loss, preds, probs
+    
+    all_probs = np.array(all_probs)
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    
+    try:
+        top5 = top_k_accuracy_score(all_labels, all_probs, k=5, labels=range(cfg.num_classes))
+    except:
+        top5 = 0.0
+    
+    return {
+        "val_loss": total_loss / max(1, total_samples),
+        "val_acc": acc,
+        "val_f1": f1,
+        "val_top5": top5
+    }
+
+def train_model(cfg, train_samples, val_samples, expert_name, fold, device):
+    print(f"\n{'='*50}")
+    print(f"Training {expert_name.upper()} - Fold {fold + 1}/{cfg.n_folds}")
+    print_memory_stats("Before: ")
+    print(f"{'='*50}")
+    
+    clear_memory(verbose=False)
+    
+    model = optimizer = scheduler = scaler = None
+    train_loader = val_loader = train_ds = val_ds = None
+    
+    try:
+        bs = cfg.batch_size_3d if expert_name in ["r3d", "mc3", "r2plus1d"] else cfg.batch_size_2d
+        
+        train_ds = RadarDataset(train_samples, cfg, augment=True)
+        val_ds = RadarDataset(val_samples, cfg, augment=False)
+        
+        train_loader = DataLoader(
+            train_ds, batch_size=bs, shuffle=True,
+            num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+            drop_last=True, persistent_workers=cfg.num_workers > 0
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=bs, shuffle=False,
+            num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+            persistent_workers=cfg.num_workers > 0
+        )
+        
+        model = get_expert(expert_name, cfg).to(device)
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Parameters: {trainable:,} / {total_params:,}")
+        print_memory_stats("After model: ")
+        
+        # Class weights for imbalanced data
+        labels = [s[1] for s in train_samples]
+        class_weights = get_class_weights(labels, cfg.num_classes).to(device)
+        
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=cfg.label_smoothing
+        )
+        
+        optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+        
+        steps_per_epoch = math.ceil(len(train_loader) / cfg.accumulation_steps)
+        total_steps = steps_per_epoch * cfg.epochs
+        
+        scheduler = OneCycleLR(
+            optimizer, max_lr=cfg.learning_rate,
+            total_steps=total_steps + 100,
+            pct_start=cfg.warmup_pct,
+            anneal_strategy='cos',
+            div_factor=25,
+            final_div_factor=1000
+        )
+        
+        scaler = GradScaler(enabled=amp_enabled)
+        early_stopping = EarlyStopping(patience=cfg.early_stopping_patience)
+        
+        best_val_acc = 0.0
+        best_top5 = 0.0
+        start_time = time.time()
+        
+        for epoch in range(1, cfg.epochs + 1):
+            epoch_start = time.time()
+            
+            train_metrics = train_one_epoch(
+                model, train_loader, criterion, optimizer,
+                scheduler, scaler, cfg, device, epoch
+            )
+            
+            torch.cuda.empty_cache()
+            
+            val_metrics = validate(model, val_loader, criterion, cfg, device)
+            
+            epoch_time = time.time() - epoch_start
+            lr = optimizer.param_groups[0]['lr']
+            
+            print(
+                f"Epoch {epoch:2d}/{cfg.epochs} | "
+                f"Loss: {train_metrics['train_loss']:.4f} | "
+                f"Train: {train_metrics['train_acc']*100:.1f}% | "
+                f"Val: {val_metrics['val_acc']*100:.1f}% | "
+                f"Top5: {val_metrics['val_top5']*100:.1f}% | "
+                f"F1: {val_metrics['val_f1']:.3f} | "
+                f"LR: {lr:.1e} | "
+                f"Time: {format_time(epoch_time)}"
+            )
+            
+            if val_metrics["val_acc"] > best_val_acc:
+                best_val_acc = val_metrics["val_acc"]
+                best_top5 = val_metrics["val_top5"]
+            
+            if early_stopping(val_metrics["val_acc"], model, epoch):
+                print(f"Early stopping at epoch {epoch}")
+                break
+            
+            if epoch % 10 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+        
+        early_stopping.load_best(model)
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        
+        total_time = time.time() - start_time
+        print(f"Training completed in {format_time(total_time)}")
+        print(f"Best Val Acc: {best_val_acc*100:.2f}% | Top5: {best_top5*100:.2f}% (Epoch {early_stopping.best_epoch})")
+        
+        result = {
+            "expert_name": expert_name,
+            "fold": fold,
+            "best_val_acc": best_val_acc,
+            "best_top5": best_top5,
+            "best_epoch": early_stopping.best_epoch,
+            "state_dict": best_state,
+            "training_time": total_time
+        }
+        
+        ckpt_path = cfg.checkpoint_dir / f"{expert_name}_fold{fold}_acc{best_val_acc*100:.1f}.pt"
+        torch.save(result, ckpt_path)
+        print(f"Saved: {ckpt_path}")
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        traceback.print_exc()
+        raise
+        
+    finally:
+        print("\nCleaning up...")
+        print_memory_stats("Before cleanup: ")
+        if train_loader: del train_loader
+        if val_loader: del val_loader
+        if train_ds: del train_ds
+        if val_ds: del val_ds
+        delete_model_safely(model, optimizer, scheduler, scaler)
+        clear_memory(verbose=True)
+
+# ============================================================
+# PSEUDO-LABELING
+# ============================================================
+@torch.no_grad()
+def generate_pseudo_labels(checkpoints, samples, cfg, device):
+    if len(samples) == 0 or len(checkpoints) == 0:
+        return []
+    
+    print(f"\nGenerating pseudo-labels on {len(samples)} samples...")
+    print_memory_stats("Before: ")
+    
+    ds = RadarDataset(samples, cfg, augment=False, is_test=True)
+    dl = DataLoader(ds, batch_size=cfg.batch_size_infer, shuffle=False,
+                   num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+    
+    all_preds, all_confs = [], []
+    
+    for ckpt in tqdm(checkpoints, desc="Model Inference"):
+        model = None
+        try:
+            model = get_expert(ckpt["expert_name"], cfg).to(device)
+            model.load_state_dict(ckpt["state_dict"])
+            model.eval()
+            
+            preds, confs = [], []
+            for batch in dl:
+                x = batch["rtm"].to(device, non_blocking=True)
+                with autocast(enabled=amp_enabled):
+                    logits = model(x)
+                    probs = F.softmax(logits, dim=1)
+                preds.extend(logits.argmax(1).cpu().numpy())
+                confs.extend(probs.max(1)[0].cpu().numpy())
+                del x, logits, probs
+            
+            all_preds.append(preds)
+            all_confs.append(confs)
+        finally:
+            if model:
+                model.cpu()
+                del model
+            clear_memory()
+    
+    del dl, ds
+    clear_memory()
+    
+    pseudo_samples = []
+    min_agree = min(cfg.pseudo_min_vote_agreement, len(checkpoints))
+    
+    for i in range(len(samples)):
+        votes = [all_preds[m][i] for m in range(len(checkpoints))]
+        confidences = [all_confs[m][i] for m in range(len(checkpoints))]
+        
+        vote_counts = Counter(votes)
+        top_cls, count = vote_counts.most_common(1)[0]
+        
+        winning_confs = [confidences[m] for m in range(len(checkpoints)) if votes[m] == top_cls]
+        avg_conf = np.mean(winning_confs)
+        
+        if count >= min_agree and avg_conf >= cfg.pseudo_confidence_threshold:
+            sample_dir, _, sample_id, group_id = samples[i]
+            pseudo_samples.append((sample_dir, int(top_cls), sample_id, group_id))
+    
+    print(f"Accepted: {len(pseudo_samples)}/{len(samples)} ({100*len(pseudo_samples)/max(1,len(samples)):.1f}%)")
+    return pseudo_samples
+
+# ============================================================
+# ENSEMBLE INFERENCE
+# ============================================================
+@torch.no_grad()
+def ensemble_predict(checkpoints, samples, cfg, device):
+    if len(samples) == 0:
+        return np.array([]), []
+    
+    print(f"\nEnsemble inference on {len(samples)} samples...")
+    
+    ds = RadarDataset(samples, cfg, augment=False, is_test=True)
+    dl = DataLoader(ds, batch_size=cfg.batch_size_infer, shuffle=False,
+                   num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+    
+    weights = np.array([ckpt["best_val_acc"] for ckpt in checkpoints])
+    weights = weights / weights.sum()
+    
+    num_samples = len(samples)
+    ensemble_probs = torch.zeros(num_samples, cfg.num_classes, dtype=torch.float32)
+    sample_ids = []
+    
+    for ckpt_idx, ckpt in enumerate(tqdm(checkpoints, desc="Ensemble")):
+        model = None
+        try:
+            model = get_expert(ckpt["expert_name"], cfg).to(device)
+            model.load_state_dict(ckpt["state_dict"])
+            model.eval()
+            
+            batch_start = 0
+            for batch in dl:
+                x = batch["rtm"].to(device, non_blocking=True)
+                batch_size = x.size(0)
+                
+                if ckpt_idx == 0:
+                    sample_ids.extend([int(sid) for sid in batch["sample_id"]])
+                
+                with autocast(enabled=amp_enabled):
+                    logits = model(x)
+                    probs = F.softmax(logits, dim=1)
+                
+                ensemble_probs[batch_start:batch_start + batch_size] += weights[ckpt_idx] * probs.cpu()
+                batch_start += batch_size
+                del x, logits, probs
+        finally:
+            if model:
+                model.cpu()
+                del model
+            clear_memory()
+    
+    del dl, ds
+    clear_memory()
+    
+    return ensemble_probs.argmax(dim=1).numpy(), sample_ids
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+def main():
+    pipeline_start = time.time()
+    print_memory_stats("Initial: ")
+    
+    train_samples, val_samples, test_samples = load_data(cfg)
+    
+    indices = np.arange(len(train_samples))
+    labels = np.array([s[1] for s in train_samples])
+    
+    if cfg.n_folds == 1:
+        train_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=cfg.seed, stratify=labels)
+        splits = [(train_idx, val_idx)]
+    else:
+        skf = StratifiedKFold(n_splits=cfg.n_folds, shuffle=True, random_state=cfg.seed)
+        splits = list(skf.split(indices, labels))
+    
+    all_checkpoints = []
+    expert_results = {}
+    
+    for expert_idx, expert_name in enumerate(cfg.experts):
+        print(f"\n{'#'*60}")
+        print(f"# EXPERT {expert_idx + 1}/{len(cfg.experts)}: {expert_name.upper()}")
+        print(f"{'#'*60}")
+        
+        expert_ckpts = []
+        
+        for fold, (train_idx, val_idx) in enumerate(splits):
+            fold_train = [train_samples[i] for i in train_idx]
+            fold_val = [train_samples[i] for i in val_idx]
+            
+            result = train_model(cfg, fold_train, fold_val, expert_name, fold, device)
+            expert_ckpts.append(result)
+            all_checkpoints.append(result)
+            
+            print(f"\n--- Cleanup after {expert_name} Fold {fold + 1} ---")
+            clear_memory(verbose=True)
+        
+        avg_acc = np.mean([r["best_val_acc"] for r in expert_ckpts])
+        avg_top5 = np.mean([r["best_top5"] for r in expert_ckpts])
+        expert_results[expert_name] = {"acc": avg_acc, "top5": avg_top5}
+        print(f"\n{expert_name.upper()} Average: {avg_acc*100:.2f}% (Top5: {avg_top5*100:.2f}%)")
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        time.sleep(1)
+    
+    print("\n" + "=" * 50)
+    print("EXPERT COMPARISON")
+    print("=" * 50)
+    for name, metrics in sorted(expert_results.items(), key=lambda x: -x[1]["acc"]):
+        print(f"  {name.upper():15s}: {metrics['acc']*100:.2f}% (Top5: {metrics['top5']*100:.2f}%)")
+    
+    if cfg.enable_pseudo_labeling and (len(val_samples) > 0 or len(test_samples) > 0):
+        print("\n" + "=" * 50)
+        print("PSEUDO-LABELING")
+        print("=" * 50)
+        
+        pseudo_val = generate_pseudo_labels(all_checkpoints, val_samples, cfg, device)
+        clear_memory(verbose=True)
+        
+        pseudo_test = generate_pseudo_labels(all_checkpoints, test_samples, cfg, device)
+        clear_memory(verbose=True)
+        
+        if len(pseudo_val) > 0 or len(pseudo_test) > 0:
+            expanded_train = train_samples + pseudo_val + pseudo_test
+            print(f"Expanded: {len(train_samples)} + {len(pseudo_val)} + {len(pseudo_test)} = {len(expanded_train)}")
+            
+            best_expert = max(expert_results.items(), key=lambda x: x[1]["acc"])[0]
+            print(f"\nRetraining {best_expert.upper()}...")
+            
+            exp_labels = [s[1] for s in expanded_train]
+            train_idx, val_idx = train_test_split(
+                np.arange(len(expanded_train)), test_size=0.1,
+                random_state=cfg.seed, stratify=exp_labels
+            )
+            
+            result = train_model(
+                cfg, [expanded_train[i] for i in train_idx],
+                [expanded_train[i] for i in val_idx],
+                best_expert, 99, device
+            )
+            all_checkpoints.append(result)
+            clear_memory(verbose=True)
+    
+    if len(test_samples) > 0:
+        print("\n" + "=" * 50)
+        print("FINAL INFERENCE")
+        print("=" * 50)
+        
+        predictions, sample_ids = ensemble_predict(all_checkpoints, test_samples, cfg, device)
+        
+        submission_path = cfg.output_dir / "submission.csv"
+        df = pd.DataFrame({"sample_id": sample_ids, "prediction": predictions})
+        df.to_csv(submission_path, index=False)
+        print(f"Saved: {submission_path}")
+        clear_memory(verbose=True)
+    
+    # Save summary
+    summary = {
+        "experts": {k: v for k, v in expert_results.items()},
+        "checkpoints": [
+            {"expert": c["expert_name"], "fold": c["fold"], 
+             "acc": c["best_val_acc"], "top5": c["best_top5"]}
+            for c in all_checkpoints
+        ]
+    }
+    with open(cfg.output_dir / "training_summary.json", 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    total_time = time.time() - pipeline_start
+    print("\n" + "=" * 60)
+    print("✅ PIPELINE COMPLETE")
+    print("=" * 60)
+    print(f"Total time: {format_time(total_time)}")
+    print(f"Models trained: {len(all_checkpoints)}")
+    best = max(expert_results.items(), key=lambda x: x[1]["acc"])
+    print(f"Best expert: {best[0].upper()} ({best[1]['acc']*100:.2f}%)")
+    print_memory_stats("Final: ")
+    print("=" * 60)
+    
+    return all_checkpoints, expert_results
+
+# ============================================================
+# RUN
+# ============================================================
+if __name__ == "__main__":
+    all_checkpoints, expert_results = main()
+else:
+    all_checkpoints, expert_results = main()
